@@ -28,6 +28,19 @@
 
 每个叶子的残余 |U₁| 由回溯中的增量向量和精确求得。
 
+硬限值判定与并列容差
+--------------------
+- **硬限值**(达标/不达标)按 **残余 |U₁| ≤ L** 严格判定, 只额外允许固定的
+  绝对浮点噪声底线 1e-9 g·mm(吸收向量求和的舍入噪声, 与 app/weighing.py
+  一致), **不**按限值或残余量级放大成相对容差——例如残余 5000、限值
+  4999.999999(真实超限 1e-6 g·mm)必须判为不达标。
+- **最优结果的数值并列**仍使用 1e-9 **相对**容差, 仅用于"残余 |U₁| 最低"
+  的并列排序与达到最优结果的组合数统计。
+- 当某枚数层只有"容差内超限"(超过硬限值、但在旧相对容差带内)的组合时,
+  不停止搜索, 继续向更大枚数寻找真正达标的组合; 0..M 枚均无法达标时返回
+  残余最低的组合及超限量。被选组合的硬限值归属与其报告模长一律按槽位/质量
+  序列独立复算, 与响应中的最终残余值严格一致。
+
 目标排序(字典序, 确定性)
 ------------------------
 1. 能达标(残余 |U₁| ≤ L)的**最少放置枚数** k* —— 从 k=0 起逐层枚举,
@@ -66,6 +79,11 @@ MAX_WEIGHT_TYPES = 6
 MAX_WEIGHTS = 3
 # 与 app/evacuation.py / app/reweigh.py 一致的数值容差
 _NUM_TOL = 1e-9
+# 硬限值判定(达标/不达标)只用固定绝对噪声底线 1e-9 g·mm(与 app/weighing.py
+# 的限值判定一致): 限值是硬性边界, 不得按残余量级放大成相对容差, 否则
+# 残余 5000、限值 4999.999999 会被误判为达标。该底线仅吸收角度/向量求和的
+# 浮点舍入噪声(典型 ≤1e-12 g·mm), 不放宽任何真实超限。
+_HARD_LIMIT_TOL = 1e-9
 
 
 def _vec_block(x: float, y: float) -> dict[str, Any]:
@@ -182,17 +200,19 @@ def plan_counterweight_compensation(
             f"方案有 {q} 个空闲启用槽位, 超过库存配重补偿上限 "
             f"{MAX_FREE_SLOTS} 个(精确枚举规模随空槽数增长), 明确拒绝。"
         )
-    # 各空槽方向的单位质径积向量 R·e^{iθ}(与其他规划器共用快照向量计算)
+    # 各空槽方向的单位质径积向量 R·e^{iθ}(快照内按槽缓存, 枚举中直接复用)
     unit_vecs = [
         snap.mass_radius_vector(1.0, f["slot"]) for f in free_slots
     ]
 
     # ---- 按放置枚数分层的完全枚举 ----
-    # 叶子: (残余 |U₁|, (槽号升序槽位序列, 对应配重质量序列))
+    # 叶子: (增量残余 |U₁|, (槽号升序槽位序列, 对应配重质量序列)); 增量模
+    # 用于分层筛选与并列排序, 被选候选的硬限值归属与报告模长由
+    # :func:`_canonical_mag` 独立复算, 与最终响应的残余值严格一致。
     base_mag = baseline_block["u1_mag_g_mm"]
 
     def _enumerate_k(k: int) -> list[tuple[float, tuple]]:
-        """枚举恰好放置 k 枚配重的全部合法组合。"""
+        """枚举恰好放置 k 枚配重的全部合法组合, 返回 (残余 |U₁|, 键)。"""
         leaves: list[tuple[float, tuple]] = []
         if k == 0:
             leaves.append((base_mag, ((), ())))
@@ -206,9 +226,8 @@ def plan_counterweight_compensation(
 
         def rec(start: int, depth: int, ux: float, uy: float) -> None:
             if depth == k:
-                # 量级 ≤ ~1e7 g·mm, 平方和不溢出, 直接 sqrt 比 hypot 快
-                mag = math.sqrt(ux * ux + uy * uy)
-                leaves.append((mag, (tuple(slots_key), tuple(masses_key))))
+                leaves.append((math.sqrt(ux * ux + uy * uy),
+                               (tuple(slots_key), tuple(masses_key))))
                 return
             need = k - depth
             for i in range(start, q - need + 1):
@@ -230,7 +249,40 @@ def plan_counterweight_compensation(
         rec(0, 0, base_x, base_y)
         return leaves
 
-    limit_tol = _NUM_TOL * max(1.0, limit)
+    def _canonical_mag(key: tuple) -> float:
+        """由 (槽位序列, 质量序列) 独立复算残余 |U₁|(与响应 final 的求和一致)。"""
+        slots_key, masses_key = key
+        ux, uy = base_x, base_y
+        for slot, mass in zip(slots_key, masses_key):
+            v = snap.mass_radius_vector(mass, slot)
+            ux += v.real
+            uy += v.imag
+        return math.hypot(ux, uy)
+
+    def _select_feasible(
+            mag_keys: list[tuple[float, tuple]]
+    ) -> Optional[dict[str, Any]]:
+        """在一层候选中选硬限值达标的最优者(并列条数按增量模统计)。
+
+        被选候选的硬限值归属与其报告模长以 :func:`_canonical_mag` 的独立
+        复算为准; 增量模恰落在硬限值噪声带内、但复算确认超限的组合被剔除
+        后, 在本层继续寻找真正达标的组合。
+        """
+        pool = [(m, key) for m, key in mag_keys
+                if m <= limit + _HARD_LIMIT_TOL]
+        while pool:
+            best_mag = min(m for m, _ in pool)
+            mag_tol = _NUM_TOL * max(1.0, best_mag)
+            optimal = [(m, key) for m, key in pool
+                       if m <= best_mag + mag_tol]
+            opt_key = min(key for _, key in optimal)
+            opt_mag = _canonical_mag(opt_key)
+            if opt_mag <= limit + _HARD_LIMIT_TOL:
+                return {"mag": opt_mag, "key": opt_key,
+                        "count": len(optimal)}
+            pool = [(m, key) for m, key in pool if key != opt_key]
+        return None
+
     evaluated = 0
     winner: Optional[dict[str, Any]] = None       # 首个达标 k 上的最优组合
     best_effort: Optional[dict[str, Any]] = None  # 0..M 内残余最低的组合
@@ -239,7 +291,8 @@ def plan_counterweight_compensation(
         evaluated += len(leaves)
         if not leaves:
             continue
-        # 该枚数下的全局最优(用于无法达标时的对照)
+        # 该枚数下的全局最优(用于无法达标时的对照); 增量模与独立复算仅差
+        # 浮点求和顺序, 对照选择/并列裁决用增量模即可
         k_best_mag = min(m for m, _ in leaves)
         k_tol = _NUM_TOL * max(1.0, k_best_mag)
         k_tied = [(m, key) for m, key in leaves if m <= k_best_mag + k_tol]
@@ -248,18 +301,11 @@ def plan_counterweight_compensation(
         if best_effort is None or k_best_mag < best_effort["mag"] - _NUM_TOL:
             best_effort = {"k": k, "mag": k_best_mag, "key": k_best_key,
                            "count": len(k_tied)}
-        # 达标组合(第一个存在达标组合的 k 即最少放置枚数)
-        feasible_leaves = [(m, key) for m, key in leaves
-                           if m <= limit + limit_tol]
-        if feasible_leaves:
-            best_mag = min(m for m, _ in feasible_leaves)
-            mag_tol = _NUM_TOL * max(1.0, best_mag)
-            optimal = [(m, key) for m, key in feasible_leaves
-                       if m <= best_mag + mag_tol]
-            opt_key = min(key for _, key in optimal)
-            opt_mag = next(m for m, key in optimal if key == opt_key)
-            winner = {"k": k, "mag": opt_mag, "key": opt_key,
-                      "count": len(optimal)}
+        # 硬限值只允许固定绝对浮点噪声, 不按残余量级放大成相对容差; 仅容差
+        # 内"超限"的组合不算达标, 继续向更大枚数寻找真正达标者
+        choice = _select_feasible(leaves)
+        if choice is not None:
+            winner = {"k": k, **choice}
             break
 
     # k=0 的空组合必然被评估, 故 best_effort 一定存在
@@ -289,8 +335,12 @@ def plan_counterweight_compensation(
     final_mag = final_block["u1_mag_g_mm"]
 
     feasible = winner is not None
-    within = final_mag <= limit + limit_tol
-    base_within = base_mag <= limit + limit_tol
+    # 硬限值判定与搜索时一致(固定绝对浮点噪声, 无相对容差), 并以最终复算的
+    # 残余值为准: feasible/within_limit/超限量/说明全部与该残余值保持一致
+    within = final_mag <= limit + _HARD_LIMIT_TOL
+    base_within = base_mag <= limit + _HARD_LIMIT_TOL
+    if feasible:
+        assert within
     excess = max(0.0, final_mag - limit)
     margin = max(0.0, limit - final_mag)
     place_txt = ", ".join(

@@ -32,6 +32,19 @@
 (回溯剪枝: 目标槽唯一、不得等于该管原槽), **精确**寻找使 |U₁| ≤ L 的
 摆放, 找到的第一个可行 k 即最少移动管数。
 
+硬限值判定与并列容差
+--------------------
+- **硬限值**(达标/不达标)按 **|U₁| ≤ L** 严格判定, 只额外允许固定的绝对
+  浮点噪声底线 1e-9 g·mm(吸收角度/向量求和的舍入噪声, 与 app/weighing.py
+  一致), **不**按限值或残余量级放大成相对容差——例如残余 5000、限值
+  4999.999999(真实超限 1e-6 g·mm)必须判为不达标。
+- **最优结果的数值并列**仍使用 1e-9 **相对**容差, 仅用于"最终 |U₁| 最小"
+  的并列排序与达到最优结果的摆放条数统计。
+- 当某层只有"容差内超限"(超过硬限值、但在旧相对容差带内)的摆放时, 不
+  停止搜索, 继续向更大 k 寻找真正达标的方案; 全部 k 都无达标方案时返回
+  不达标及移动上限内残余最低的对照摆放。被选候选的硬限值归属与其报告模长
+  一律按目标槽序列独立复算, 与响应中的最终残余值严格一致。
+
 目标排序(字典序, 确定性)
 ------------------------
 在达到最少移动数的摆放中:
@@ -68,8 +81,13 @@ from .plan_snapshot import parse_plan_snapshot
 MAX_TUBES = 10
 MAX_ENABLED_SLOTS = 16
 MAX_MOVES = 3
-# 与 app/compare.py / app/loading.py 一致的数值容差
+# 最优结果并列(数值容差)用 1e-9 相对容差, 与 app/compare.py / app/loading.py 一致
 _NUM_TOL = 1e-9
+# 硬限值判定(达标/不达标)只用固定绝对噪声底线 1e-9 g·mm(与 app/weighing.py
+# 的限值判定一致): 限值是硬性边界, 不得按残余量级放大成相对容差, 否则
+# 残余 5000、限值 4999.999999 会被误判为达标。该底线仅吸收角度/向量求和的
+# 浮点舍入噪声(典型 ≤1e-12 g·mm), 不放宽任何真实超限。
+_HARD_LIMIT_TOL = 1e-9
 
 
 def _vec_block(x: float, y: float) -> dict[str, Any]:
@@ -297,7 +315,13 @@ def plan_slot_evacuation(plan: dict[str, Any],
     usable_target_slots = sorted(set(empty_slots) | set(movable_origin_slots))
 
     def _enumerate_k(k: int) -> list[tuple[float, tuple[int, ...]]]:
-        """枚举恰好移动 k 支试管的全部合法摆放, 返回 (|U₁|², 目标槽序列)。"""
+        """枚举恰好移动 k 支试管的全部合法摆放, 返回 (|U₁|, 目标槽序列)。
+
+        叶子的 |U₁| 用回溯中的增量向量和求得(与独立复算仅差浮点求和顺序,
+        量级 ≤1e7 g·mm 时差约 ≤1e-9 g·mm), 用于分层筛选与并列排序; 硬限值
+        边界附近的候选再由 :func:`_canonical_mag` 独立复算裁决, 保证最终
+        达标判定与响应中的最终残余值严格一致。
+        """
         optional = [j for j in movable if j not in forced]
         leaves: list[tuple[float, tuple[int, ...]]] = []
         if k < len(forced) or k - len(forced) > len(optional):
@@ -324,7 +348,7 @@ def plan_slot_evacuation(plan: dict[str, Any],
 
             def rec(pos: int, u: complex) -> None:
                 if pos == k:
-                    leaves.append((u.real * u.real + u.imag * u.imag, key_of()))
+                    leaves.append((abs(u), key_of()))
                     return
                 j = movers[pos]
                 origin = tubes[j]["origin"]
@@ -340,6 +364,15 @@ def plan_slot_evacuation(plan: dict[str, Any],
             rec(0, base)
         return leaves
 
+    def _canonical_mag(key: tuple[int, ...]) -> float:
+        """由目标槽序列独立复算最终 |U₁|(与响应 final_u1 的求和完全一致)。"""
+        ux = uy = 0.0
+        for j, slot in enumerate(key):
+            v = _vector(j, slot)
+            ux += v.real
+            uy += v.imag
+        return math.hypot(ux, uy)
+
     # ---- 按移动数从少到多精确搜索 ----
     def _best_of(mag_keys: list[tuple[float, tuple[int, ...]]],
                  ) -> tuple[float, tuple[int, ...]]:
@@ -351,7 +384,30 @@ def plan_slot_evacuation(plan: dict[str, Any],
         mag = next(m for m, k in tied if k == key)
         return mag, key
 
-    limit_tol = _NUM_TOL * max(1.0, limit)
+    def _select_feasible(
+            mag_keys: list[tuple[float, tuple[int, ...]]]
+    ) -> Optional[dict[str, Any]]:
+        """在一层候选中选硬限值达标的最优者(并列条数按增量模统计)。
+
+        增量模用于排序与并列计数; 被选候选的**硬限值归属**与其报告模长以
+        :func:`_canonical_mag` 的独立复算为准。增量模恰落在硬限值噪声带内、
+        但复算确认超限的候选被剔除后, 在本层继续寻找真正达标的摆放。
+        """
+        pool = [(m, key) for m, key in mag_keys
+                if m <= limit + _HARD_LIMIT_TOL]
+        while pool:
+            best_mag = min(m for m, _ in pool)
+            mag_tol = _NUM_TOL * max(1.0, best_mag)
+            optimal = [(m, key) for m, key in pool
+                       if m <= best_mag + mag_tol]
+            opt_key = min(key for _, key in optimal)
+            opt_mag = _canonical_mag(opt_key)
+            if opt_mag <= limit + _HARD_LIMIT_TOL:
+                return {"mag": opt_mag, "key": opt_key,
+                        "count": len(optimal)}
+            pool = [(m, key) for m, key in pool if key != opt_key]
+        return None
+
     winner: Optional[dict[str, Any]] = None       # 首个可行 k 上的最优摆放
     best_effort: Optional[dict[str, Any]] = None  # 0..M 内 |U₁| 最小的摆放
     evaluated = 0
@@ -360,28 +416,16 @@ def plan_slot_evacuation(plan: dict[str, Any],
         evaluated += len(leaves)
         if not leaves:
             continue
-        # 该移动数下的全局最优(用于无可行摆放时的对照)
-        mags = [(math.sqrt(m2), key) for m2, key in leaves]
-        k_best_mag, k_best_key = _best_of(mags)
+        # 该移动数下的全局最优(用于无可行摆放时的对照); 增量模与独立复算
+        # 仅差浮点求和顺序, 对照选择/并列裁决用增量模即可
+        k_best_mag, k_best_key = _best_of(leaves)
         if best_effort is None or k_best_mag < best_effort["mag"] - _NUM_TOL:
             best_effort = {"k": k, "mag": k_best_mag, "key": k_best_key}
-        # 满足限值的摆放(第一个可行 k 即最少移动数)
-        feasible_leaves = [(m, key) for m, key in mags if m <= limit + limit_tol]
-        if feasible_leaves:
-            best_mag = min(m for m, _ in feasible_leaves)
-            mag_tol = _NUM_TOL * max(1.0, best_mag)
-            optimal = [
-                (m, key) for m, key in feasible_leaves
-                if m <= best_mag + mag_tol
-            ]
-            opt_key = min(key for _, key in optimal)
-            opt_mag = next(m for m, key in optimal if key == opt_key)
-            winner = {
-                "k": k,
-                "mag": opt_mag,
-                "key": opt_key,
-                "count": len(optimal),
-            }
+        # 硬限值只允许固定绝对浮点噪声, 不按量级放大成相对容差; 仅容差内
+        # "超限"的摆放不算达标, 搜索继续向更大的 k 寻找真正达标者
+        choice = _select_feasible(leaves)
+        if choice is not None:
+            winner = {"k": k, **choice}
             break
 
     out = _context()
@@ -421,9 +465,11 @@ def plan_slot_evacuation(plan: dict[str, Any],
     if winner is not None:
         payload = _arrangement_payload(winner["k"], winner["key"], winner["count"])
         out.update(payload)
+        final_mag = payload["final_u1"]["u1_mag_g_mm"]
+        # 搜索时的达标判定与最终复算必须一致(二者使用同一独立复算)
+        assert final_mag <= limit + _HARD_LIMIT_TOL
         out["feasible"] = True
         out["within_limit"] = True
-        final_mag = payload["final_u1"]["u1_mag_g_mm"]
         out["excess_g_mm"] = 0.0
         out["margin_g_mm"] = max(0.0, limit - final_mag)
         out["reason"] = (

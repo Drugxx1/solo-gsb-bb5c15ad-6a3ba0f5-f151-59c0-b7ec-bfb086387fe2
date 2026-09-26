@@ -29,6 +29,18 @@ s 支**备品试管**(1 ≤ s ≤ 12, 编号互不相同, 质量为正, 且编�
 回溯枚举(维护备品占用标记), 每个叶子由增量向量和精确求得最终 |U₁|, 并累计
 总质量差 D = Σ_j |m'_j − m_j|(g)。
 
+硬限值判定与并列容差
+--------------------
+- **硬限值**(达标/不达标)按 **最终 |U₁| ≤ L** 严格判定, 只额外允许固定的
+  绝对浮点噪声底线 1e-9 g·mm(吸收向量求和的舍入噪声, 与 app/weighing.py
+  一致), **不**按限值或残余量级放大成相对容差——例如残余 5000、限值
+  4999.999999(真实超限 1e-6 g·mm)必须判为不达标。
+- **最优结果的数值并列**仍使用 1e-9 **相对**容差, 仅用于总质量差 D 并列时
+  "残余 |U₁| 最小"的排序与达到最优结果的映射条数统计。
+- 只有"容差内超限"(超过硬限值、但在旧相对容差带内)的映射时, 这些映射不
+  计为达标, 直接进入无达标映射分支; 被选候选的硬限值归属与其报告模长一律
+  按备品编号序列独立复算, 与响应中的最终残余值严格一致。
+
 目标排序(字典序, 确定性)
 ------------------------
 1. **先选总质量差 D 最小的达标映射**(最终 |U₁| ≤ L);
@@ -66,6 +78,11 @@ MAX_REPLACE = 4
 MAX_SPARES = 12
 # 与 app/evacuation.py / app/counterweight.py 一致的数值容差
 _NUM_TOL = 1e-9
+# 硬限值判定(达标/不达标)只用固定绝对噪声底线 1e-9 g·mm(与 app/weighing.py
+# 的限值判定一致): 限值是硬性边界, 不得按残余量级放大成相对容差, 否则
+# 残余 5000、限值 4999.999999 会被误判为达标。该底线仅吸收角度/向量求和的
+# 浮点舍入噪声(典型 ≤1e-12 g·mm), 不放宽任何真实超限。
+_HARD_LIMIT_TOL = 1e-9
 
 
 def _vec_block(x: float, y: float) -> dict[str, Any]:
@@ -238,7 +255,9 @@ def plan_spare_replacement(plan: dict[str, Any],
         rep_dirs.append((v.real, v.imag))
 
     # ---- 备品不重复使用的一对一完全枚举(排列) ----
-    # 叶子: (|U₁|, 总质量差 D, 备品编号序列(按待换管号升序位置))
+    # 叶子: (增量残余 |U₁|, 总质量差 D, 备品编号序列(按待换管号升序位置));
+    # 增量模用于硬限值筛选与并列排序, 被选候选的硬限值归属与报告模长由
+    # :func:`_canonical_mag` 独立复算, 与最终响应的残余值严格一致。
     leaves: list[tuple[float, float, tuple[int, ...]]] = []
     used_flag = [False] * s_count
     key_buf: list[int] = []
@@ -265,14 +284,30 @@ def plan_spare_replacement(plan: dict[str, Any],
     rec(0, unc_x, unc_y, 0.0)
     evaluated = len(leaves)
 
-    limit_tol = _NUM_TOL * max(1.0, limit)
-    feasible_leaves = [(m, d, key) for m, d, key in leaves
-                       if m <= limit + limit_tol]
-    if feasible_leaves:
+    spare_by_id = {sp["tube_id"]: sp["mass_g"] for sp in spare_list}
+
+    def _canonical_mag(key: tuple[int, ...]) -> float:
+        """由备品编号序列独立复算最终 |U₁|(与响应 final 的求和顺序一致)。"""
+        fx, fy = unc_x, unc_y
+        for pos, sid in enumerate(key):
+            v = snap.mass_radius_vector(
+                spare_by_id[sid], placed[replaced_ids[pos]]["slot"]
+            )
+            fx += v.real
+            fy += v.imag
+        return math.hypot(fx, fy)
+
+    # 硬限值: 只允许固定绝对浮点噪声, 不按残余量级放大成相对容差; 仅容差内
+    # "超限"的映射不算达标(被选候选的真实归属以独立复算为准)
+    feasible_pool = [(m, d, key) for m, d, key in leaves
+                     if m <= limit + _HARD_LIMIT_TOL]
+    feasible_mapping_count = len(feasible_pool)
+    winner = False
+    while feasible_pool:
         # ① 总质量差最小
-        best_d = min(d for _, d, _ in feasible_leaves)
+        best_d = min(d for _, d, _ in feasible_pool)
         d_tol = _NUM_TOL * max(1.0, best_d)
-        band = [(m, d, key) for m, d, key in feasible_leaves
+        band = [(m, d, key) for m, d, key in feasible_pool
                 if d <= best_d + d_tol]
         # ② 残余 |U₁| 最小
         best_mag = min(m for m, _, _ in band)
@@ -281,11 +316,22 @@ def plan_spare_replacement(plan: dict[str, Any],
                    if m <= best_mag + mag_tol]
         # ③ 待换管号顺序对应的备品编号序列字典序
         opt_key = min(key for _, _, key in optimal)
-        opt_leaf = next(leaf for leaf in optimal if leaf[2] == opt_key)
-        winner = True
-        chosen_mag, chosen_d, chosen_key = opt_leaf
-        optimal_count = len(optimal)
-    else:
+        opt_canonical_mag = _canonical_mag(opt_key)
+        if opt_canonical_mag <= limit + _HARD_LIMIT_TOL:
+            opt_leaf = next(leaf for leaf in optimal if leaf[2] == opt_key)
+            winner = True
+            # 报告模长以独立复算为准; 总质量差为精确绝对值求和, 直接采用
+            chosen_mag, chosen_d, chosen_key = (
+                opt_canonical_mag, opt_leaf[1], opt_key)
+            optimal_count = len(optimal)
+            break
+        # 增量模恰落在硬限值噪声带内、但独立复算确认超限: 剔除后继续寻找
+        feasible_pool = [
+            (m, d, key) for m, d, key in feasible_pool if key != opt_key
+        ]
+        feasible_mapping_count -= 1
+
+    if not winner:
         # 无达标映射: 残余 |U₁| 最低; 容差内并列按备品编号序列裁决
         best_mag = min(m for m, _, _ in leaves)
         mag_tol = _NUM_TOL * max(1.0, best_mag)
@@ -293,12 +339,10 @@ def plan_spare_replacement(plan: dict[str, Any],
                 if m <= best_mag + mag_tol]
         best_key = min(key for _, _, key in tied)
         chosen_leaf = next(leaf for leaf in tied if leaf[2] == best_key)
-        winner = False
         chosen_mag, chosen_d, chosen_key = chosen_leaf
         optimal_count = len(tied)
 
     # ---- 由裁决序列独立复算最终 U₁ 与逐管替换映射 ----
-    spare_by_id = {sp["tube_id"]: sp["mass_g"] for sp in spare_list}
     mapping_rows: list[dict[str, Any]] = []
     final_x, final_y = unc_x, unc_y
     replaced_mass_before = replaced_mass_after = 0.0
@@ -358,7 +402,12 @@ def plan_spare_replacement(plan: dict[str, Any],
     tube_rows = [final_slot_of[s] for s in sorted(final_slot_of)]
 
     feasible = winner
-    within = final_mag <= limit + limit_tol
+    # 硬限值判定与搜索时一致(固定绝对浮点噪声, 无相对容差), 并以最终复算的
+    # 残余值为准: feasible/within_limit/基线标记/超限量/说明全部与该残余值
+    # 保持一致
+    within = final_mag <= limit + _HARD_LIMIT_TOL
+    if feasible:
+        assert within
     excess = max(0.0, final_mag - limit)
     margin = max(0.0, limit - final_mag)
     map_txt = ", ".join(
@@ -370,7 +419,7 @@ def plan_spare_replacement(plan: dict[str, Any],
     if feasible:
         reason = (
             f"在精确枚举的 {evaluated} 种备品一对一(不重复)映射中, "
-            f"{len(feasible_leaves)} 种满足残余 |U₁| ≤ 限值 {limit:g} g·mm; "
+            f"{feasible_mapping_count} 种满足残余 |U₁| ≤ 限值 {limit:g} g·mm; "
             f"取总质量差最小者: 总质量差 {total_diff:.6g} g({map_txt}), "
             f"替换后残余 |U₁|={final_mag:.6g} g·mm ≤ 限值(替换前 "
             f"{base_mag:.6g} g·mm), 判定达标; 总质量差并列时已按残余 |U₁| "
@@ -409,12 +458,12 @@ def plan_spare_replacement(plan: dict[str, Any],
         "spare_count": s_count,
         "u1_limit_g_mm": limit,
         "evaluated_mappings": evaluated,
-        "feasible_mapping_count": len(feasible_leaves),
+        "feasible_mapping_count": feasible_mapping_count,
         "baseline": {
             **baseline_block,
             "total_mass_g": base_total_mass,
             "centrifugal_force_n": omega ** 2 * base_mag * 1e-6,
-            "within_limit": base_mag <= limit + limit_tol,
+            "within_limit": base_mag <= limit + _HARD_LIMIT_TOL,
             "excess_g_mm": max(0.0, base_mag - limit),
             "margin_g_mm": max(0.0, limit - base_mag),
         },

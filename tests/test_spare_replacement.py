@@ -108,8 +108,8 @@ def _brute(plan, replaced, spares, limit):
             d += abs(sm - placed[rids[j]]["m"])
         key = tuple(sp[ii][0] for ii in perm)
         leaves.append((abs(u), d, key))
-    lim_tol = 1e-9 * max(1.0, limit)
-    feas = [(m, d, k) for m, d, k in leaves if m <= limit + lim_tol]
+    # 硬限值: 只允许固定绝对浮点噪声 1e-9 g·mm, 不按限值量级放大容差
+    feas = [(m, d, k) for m, d, k in leaves if m <= limit + 1e-9]
     if feas:
         bd = min(d for _, d, _ in feas)
         dtol = 1e-9 * max(1.0, bd)
@@ -185,6 +185,38 @@ class TestSpareReplacement(unittest.TestCase):
             [m["spare_tube_id"] for m in r["mappings"]], [10, 11])
         self.assertEqual(r["optimal_mapping_count"], 2)
         self.assertTrue(r["tie_broken"])
+
+    def test_hard_limit_microscopic_excess_not_feasible(self):
+        # 对径 50/50(|U₁|=0), 用 100 g 备品替换槽 0 的管 1 后残余恰好
+        # 5000 g·mm; 限值 4999.999999 g·mm(真实超限 1e-6 g·mm)时,
+        # 旧实现按限值量级加 1e-9 相对容差(≈5e-6)会把该映射误判为达标,
+        # 硬限值判定必须判不达标: feasible/within_limit/feasible_mapping_count/
+        # 超限量/说明均与最终复算残余一致; 基线(平衡)标记仍为达标。
+        p = _balanced_plan()
+        limit = 4999.999999
+        r = plan_spare_replacement(
+            p, [1], [{"tube_id": 10, "mass_g": 100.0}],
+            u1_limit_g_mm=limit)
+        self.assertFalse(r["feasible"])
+        self.assertFalse(r["within_limit"])
+        self.assertTrue(r["baseline"]["within_limit"])
+        self.assertEqual(r["feasible_mapping_count"], 0)
+        self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], 5000.0, places=9)
+        self.assertAlmostEqual(r["excess_g_mm"], 5000.0 - limit, delta=1e-12)
+        self.assertEqual(r["margin_g_mm"], 0.0)
+        self.assertIn("不达标", r["reason"])
+
+    def test_residual_equal_to_limit_is_feasible(self):
+        # 残余恰好等于限值(5000.0 == 5000.0)仍须判为达标
+        p = _balanced_plan()
+        r = plan_spare_replacement(
+            p, [1], [{"tube_id": 10, "mass_g": 100.0}],
+            u1_limit_g_mm=5000.0)
+        self.assertTrue(r["feasible"])
+        self.assertTrue(r["within_limit"])
+        self.assertEqual(r["feasible_mapping_count"], 1)
+        self.assertEqual(r["excess_g_mm"], 0.0)
+        self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], 5000.0, places=9)
 
     def test_no_feasible_returns_lowest_residual(self):
         # 对径 50/50; 备品 48 g(残余 200)与 49 g(残余 100); 限值 50:

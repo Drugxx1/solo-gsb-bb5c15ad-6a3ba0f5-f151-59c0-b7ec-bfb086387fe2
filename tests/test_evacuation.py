@@ -121,7 +121,7 @@ def _brute(plan, failed, limit, max_moves):
             best_eff = (bmag, bkey, k)
         feas = [
             (m, kk) for m, kk in leaves
-            if m <= limit + 1e-9 * max(1.0, limit)
+            if m <= limit + 1e-9
         ]
         if feas:
             fm = min(m for m, _ in feas)
@@ -191,6 +191,49 @@ class TestSlotEvacuation(unittest.TestCase):
         self.assertFalse(r["tie_broken"])
         self.assertEqual(r["moves"], [])
         self.assertAlmostEqual(r["final_u1"]["u1_mag_g_mm"], 0.0, places=9)
+
+    def test_hard_limit_microscopic_excess_not_feasible(self):
+        # 残余恰好 5000 g·mm、限值 4999.999999 g·mm(真实超限 1e-6 g·mm):
+        # 旧实现按限值量级加 1e-9 相对容差(≈5e-6)会把该结果误判为达标,
+        # 硬限值判定必须判为不达标, 并返回残余最低的对照摆放与超限量。
+        p = _plan(1, {0: (1, 50.0, False)})
+        limit = 4999.999999
+        r = plan_slot_evacuation(p, failed_slots=[0],
+                                 u1_limit_g_mm=limit, max_moves=1)
+        self.assertFalse(r["feasible"])
+        self.assertFalse(r["within_limit"])
+        self.assertIsNone(r["moves_required"])
+        self.assertAlmostEqual(r["final_u1"]["u1_mag_g_mm"], 5000.0, places=9)
+        self.assertAlmostEqual(r["excess_g_mm"], 5000.0 - limit, delta=1e-12)
+        self.assertIn("没有", r["reason"])
+        be = r["best_effort"]
+        self.assertEqual(be["moves_used"], 1)
+        self.assertAlmostEqual(be["final_u1"]["u1_mag_g_mm"], 5000.0, places=9)
+
+    def test_residual_equal_to_limit_is_feasible(self):
+        # 残余恰好等于限值(5000.0 == 5000.0)仍须判为达标
+        p = _plan(1, {0: (1, 50.0, False)})
+        r = plan_slot_evacuation(p, failed_slots=[0],
+                                 u1_limit_g_mm=5000.0, max_moves=1)
+        self.assertTrue(r["feasible"])
+        self.assertTrue(r["within_limit"])
+        self.assertEqual(r["excess_g_mm"], 0.0)
+        self.assertAlmostEqual(r["final_u1"]["u1_mag_g_mm"], 5000.0, places=9)
+
+    def test_layered_search_skips_tolerance_only_over_limit(self):
+        # 失效槽 0 上的管 1(50 g)必迁, 槽 6 上的管 2(50 g)可一起移动:
+        # 移动 1 支的最低残余为 2588.190...(管 1→槽 1), 移动 2 支可组成新
+        # 对径对使残余为 0。把限值设在 1 支最低残余之下、但在旧相对容差
+        # (≈2.6e-6 g·mm)之内时, 旧实现会在 k=1 层停止并误报达标; 修复后
+        # 必须继续搜索到 k=2, 返回真正达标的 2 次移动方案。
+        p = _plan(1, {0: (1, 50.0, False), 6: (2, 50.0, False)})
+        one_move_min = 2588.1904510252075
+        limit = one_move_min - 1e-6
+        r = plan_slot_evacuation(p, failed_slots=[0],
+                                 u1_limit_g_mm=limit, max_moves=3)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["moves_required"], 2)
+        self.assertAlmostEqual(r["final_u1"]["u1_mag_g_mm"], 0.0, places=7)
 
     def test_infeasible_limit_with_best_effort(self):
         # 限值 1300 < 1 次移动可达的最小 2588.19: 不可行, 对照为 1 次移动

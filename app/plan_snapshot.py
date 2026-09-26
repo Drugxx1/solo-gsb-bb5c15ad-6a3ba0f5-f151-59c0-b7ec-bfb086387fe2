@@ -30,7 +30,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # 与 evacuation/counterweight/spare_replacement 一致的数值容差
@@ -78,6 +78,9 @@ class PlanSnapshot:
     occupied: dict[int, int]
     unplaced_tube_ids: list[int]
     base_vector: complex
+    # 各槽单位质径积向量 R·e^{iθ} 的惰性缓存(槽角在一次解析中固定,
+    # 供三个规划器的大规模枚举反复调用 mass_radius_vector 时避免重复求三角函数)
+    _unit_vec_cache: dict[int, complex] = field(default_factory=dict)
 
     # ---- 便捷访问 ----
     @property
@@ -108,10 +111,16 @@ class PlanSnapshot:
         """质量 mass_g 的物体放在 slot 时的质径积向量 R·m·e^{iθ} (g·mm)。
 
         三个规划器(配重、备品、迁移注入)共用同一向量计算, 角度一律以
-        ``slot_state`` 为唯一事实来源。
+        ``slot_state`` 为唯一事实来源。单位向量 R·e^{iθ} 按槽缓存,
+        大规模枚举时只需逐叶子做一次复数乘法, 不重复求三角函数。
         """
-        a = math.radians(self.slots[slot]["angle_deg"])
-        v = self.radius_mm * mass_g * complex(math.cos(a), math.sin(a))
+        if slot not in self._unit_vec_cache:
+            a = math.radians(self.slots[slot]["angle_deg"])
+            self._unit_vec_cache[slot] = (
+                self.radius_mm * complex(math.cos(a), math.sin(a))
+            )
+        unit = self._unit_vec_cache[slot]
+        v = mass_g * unit
         if not math.isfinite(v.real) or not math.isfinite(v.imag):
             raise ValueError(
                 f"方案 {self.plan_id} 的质径积计算溢出"

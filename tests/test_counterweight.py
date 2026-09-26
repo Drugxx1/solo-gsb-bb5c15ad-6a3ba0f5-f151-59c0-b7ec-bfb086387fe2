@@ -86,7 +86,6 @@ def _brute(plan, weights, limit, max_weights):
         ux += p["mass"] * radius * math.cos(a)
         uy += p["mass"] * radius * math.sin(a)
     base = complex(ux, uy)
-    lim_tol = 1e-9 * max(1.0, limit)
 
     best_effort = None
     for k in range(0, max_weights + 1):
@@ -116,7 +115,8 @@ def _brute(plan, weights, limit, max_weights):
         bmag = next(m for m, key in btied if key == bkey)
         if best_effort is None or bmag < best_effort[0] - 1e-9:
             best_effort = (bmag, bkey, k, len(btied))
-        feas = [(m, key) for m, key in leaves if m <= limit + lim_tol]
+        # 硬限值: 只允许固定绝对浮点噪声 1e-9 g·mm, 不按限值量级放大容差
+        feas = [(m, key) for m, key in leaves if m <= limit + 1e-9]
         if feas:
             fm = min(m for m, _ in feas)
             ftol = 1e-9 * max(1.0, fm)
@@ -171,6 +171,51 @@ class TestCounterweightCompensation(unittest.TestCase):
         expect = 5000.0 - 2500.0 * math.sqrt(3.0)
         self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], expect, places=6)
         self.assertAlmostEqual(r["margin_g_mm"], 1000.0 - expect, places=6)
+
+    def test_hard_limit_microscopic_excess_not_feasible(self):
+        # 补偿前残余恰好 5000 g·mm、限值 4999.999999 g·mm(真实超限
+        # 1e-6 g·mm), 且放置上限 0 枚: 旧实现按限值量级加 1e-9 相对容差
+        # (≈5e-6)会把基线误判为达标; 硬限值判定必须判不达标,
+        # feasible/within_limit/基线标记/超限量均与最终残余一致。
+        p = _single_plan()
+        limit = 4999.999999
+        r = plan_counterweight_compensation(
+            p, [{"mass_g": 50.0, "stock": 3}],
+            u1_limit_g_mm=limit, max_weights=0)
+        self.assertFalse(r["feasible"])
+        self.assertFalse(r["within_limit"])
+        self.assertFalse(r["baseline"]["within_limit"])
+        self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], 5000.0, places=9)
+        self.assertAlmostEqual(r["excess_g_mm"], 5000.0 - limit, delta=1e-12)
+        self.assertEqual(r["margin_g_mm"], 0.0)
+        self.assertIn("不达标", r["reason"])
+
+    def test_residual_equal_to_limit_is_feasible(self):
+        # 残余恰好等于限值(5000.0 == 5000.0)仍须判为达标
+        p = _single_plan()
+        r = plan_counterweight_compensation(
+            p, [{"mass_g": 50.0, "stock": 3}],
+            u1_limit_g_mm=5000.0, max_weights=0)
+        self.assertTrue(r["feasible"])
+        self.assertTrue(r["within_limit"])
+        self.assertTrue(r["baseline"]["within_limit"])
+        self.assertEqual(r["excess_g_mm"], 0.0)
+        self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], 5000.0, places=9)
+
+    def test_layered_search_skips_tolerance_only_over_limit(self):
+        # 单管 50 g(U=5000∠0°), 只有 25 g 配重(库存 2): 1 枚放对径槽 6 的
+        # 残余为 2500; 2 枚放槽 5/7 的残余为 5000−2500√3 ≈ 669.87。把限值
+        # 设在 2500 之下、但在旧相对容差(≈2.5e-6 g·mm)之内时, 旧实现会在
+        # k=1 层停止并误报达标; 修复后必须继续到 k=2 返回真正达标的方案。
+        p = _single_plan()
+        limit = 2500.0 - 1e-6
+        r = plan_counterweight_compensation(
+            p, [{"mass_g": 25.0, "stock": 2}],
+            u1_limit_g_mm=limit, max_weights=3)
+        self.assertTrue(r["feasible"])
+        self.assertEqual(r["weights_used"], 2)
+        expect = 5000.0 - 2500.0 * math.sqrt(3.0)
+        self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], expect, places=6)
 
     def test_stock_limit_makes_infeasible(self):
         # 同上但 25 g 配重仅 1 件库存: 放 2 枚的组合不存在, 无法达标;
