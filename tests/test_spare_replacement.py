@@ -14,6 +14,7 @@ import random
 import unittest
 
 from app.spare_replacement import plan_spare_replacement
+from app.plan_snapshot import hard_limit_slack
 
 
 def _plan(pid, placements, radius=100.0, slots_n=12, enabled=None, name=None,
@@ -108,8 +109,13 @@ def _brute(plan, replaced, spares, limit):
             d += abs(sm - placed[rids[j]]["m"])
         key = tuple(sp[ii][0] for ii in perm)
         leaves.append((abs(u), d, key))
-    lim_tol = 1e-9 * max(1.0, limit)
-    feas = [(m, d, k) for m, d, k in leaves if m <= limit + lim_tol]
+    # 硬限值判定与被测模块一致: 只容绝对舍入余量, 不随限值放大
+    term_scale = max(
+        [abs(t["v"]) for t in placed.values()]
+        + [abs(sm * dv) for sm in (s[1] for s in sp) for dv in dirs]
+        + [0.0])
+    slack = hard_limit_slack(term_scale, len(placed))
+    feas = [(m, d, k) for m, d, k in leaves if m <= limit + slack]
     if feas:
         bd = min(d for _, d, _ in feas)
         dtol = 1e-9 * max(1.0, bd)
@@ -200,6 +206,28 @@ class TestSpareReplacement(unittest.TestCase):
         self.assertEqual(r["mappings"][0]["spare_tube_id"], 10)
         self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], 100.0, places=6)
         self.assertAlmostEqual(r["excess_g_mm"], 50.0, places=6)
+        self.assertIn("不达标", r["reason"])
+
+    def test_limit_tolerance_does_not_hide_real_exceedance(self):
+        # 边界回归: 对径两支 50 g(替换前 |U₁|=0), 用 100 g 备品替换槽 0°
+        # 的待换管后残余 |U₁| 恰为 5000(=100·(100−50)), 限值=4999.999999
+        # (真实超出 1e-6 g·mm)。旧实现用随限值放大的 1e-9 相对容差(约
+        # 5e-6)放宽硬限值, 会把该映射误判为达标。必须返回不达标、残余最低
+        # 映射与 1e-6 超限量; 基线(替换前)本身达标。
+        p = _balanced_plan()
+        r = plan_spare_replacement(
+            p, [1], [{"tube_id": 10, "mass_g": 100.0}],
+            u1_limit_g_mm=4999.999999)
+        self.assertFalse(r["feasible"])
+        self.assertFalse(r["within_limit"])
+        self.assertEqual(r["feasible_mapping_count"], 0)
+        self.assertEqual(r["mappings"][0]["spare_tube_id"], 10)
+        self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], 5000.0, places=9)
+        self.assertAlmostEqual(r["excess_g_mm"], 1e-6, places=12)
+        self.assertEqual(r["margin_g_mm"], 0.0)
+        # 替换前残余为 0, 基线仍达标(基线标记与基线残余一致)
+        self.assertTrue(r["baseline"]["within_limit"])
+        self.assertEqual(r["baseline"]["excess_g_mm"], 0.0)
         self.assertIn("不达标", r["reason"])
 
     def test_original_slots_and_unchanged_tubes_kept(self):

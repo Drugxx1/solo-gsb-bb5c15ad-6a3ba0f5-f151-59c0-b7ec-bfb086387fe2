@@ -36,6 +36,45 @@ from typing import Any, Optional
 # 与 evacuation/counterweight/spare_replacement 一致的数值容差
 _NUM_TOL = 1e-9
 
+# 双精度机器精度: 质径积向量求和/三角函数的舍入误差量级
+_ROUND_EPS = 2.220446049250313e-16
+# 硬限值判定的绝对舍入余量底线(g·mm): 使限值为 0、数学上恰好抵消的理想
+# 摆放(直接复算可能残留 1e-12 级的向量和)仍判达标
+_HARD_LIMIT_SLACK_FLOOR = 1e-9
+
+
+def hard_limit_slack(term_scale_g_mm: float, term_count: int) -> float:
+    """硬限值(一阶不平衡量限值)判定允许的**绝对**舍入余量(g·mm)。
+
+    应急迁移/库存配重/备品替换三个只读规划器共用。该余量只用于吸收
+    ``U₁ = R·Σ m·e^{iθ}`` 双精度求和与三角函数引入的舍入误差: 以单项
+    质径积的最大量级与求和项数估计前向误差上界, 并设 1e-9 g·mm 的绝对
+    底线。
+
+    关键性质: 它是**绝对**余量, 不随限值本身放大——因此不会把物理上真正
+    超限的结果误判为达标。例如残余 |U₁|=5000、限值=4999.999999(真实超出
+    1e-6 g·mm)时, 该余量在 5000 量级下恰为 1e-9 底线, 超限判定不变。
+    它与"最优结果之间的数值并列容差"(1e-9 相对容差)严格分开: 后者只用于
+    在已达标的候选里裁决并列最优, 绝不放宽硬限值。
+    """
+    return max(
+        _HARD_LIMIT_SLACK_FLOOR,
+        16.0 * max(1, int(term_count)) * _ROUND_EPS
+        * max(1.0, abs(float(term_scale_g_mm))),
+    )
+
+
+def within_hard_limit(mag_g_mm: float, limit_g_mm: float,
+                      term_scale_g_mm: float, term_count: int) -> bool:
+    """硬限值判定: 残余 |U₁| 是否确实不超过限值。
+
+    仅容 :func:`hard_limit_slack` 给出的绝对舍入余量; 任何真实超出量大于
+    该余量(如限值 4999.999999、残余 5000)一律判为超限。
+    """
+    return float(mag_g_mm) <= float(limit_g_mm) + hard_limit_slack(
+        term_scale_g_mm, term_count
+    )
+
 
 @dataclass(frozen=True)
 class TubeSnapshot:

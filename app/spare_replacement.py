@@ -16,8 +16,12 @@ s 支**备品试管**(1 ≤ s ≤ 12, 编号互不相同, 质量为正, 且编�
     U₁ = U₁(base)
          + R · Σ_j (m'_j − m_j) · e^{iθ_j}            (g·mm)
 
-其中 j 遍历待换管(θ_j 为该管原槽角度, m'_j 为换上的备品质量), 必须不超过给定
-的一阶不平衡量限值 L(必填, 非负)。
+其中 j 遍历待换管(θ_j 为该管原槽角度, m'_j 为换上的备品质量)。映射必须
+使最终 |U₁| 不超过给定的一阶不平衡量限值 L(必填, 非负)。硬限值判定只
+允许一个**绝对**舍入余量(吸收双精度向量求和/三角函数的舍入误差,
+1e-9 g·mm 量级, 不随限值放大); 物理上真实超限(即使仅超出极小量, 如
+残余 5000、限值 4999.999999)一律判超限。1e-9 的相对容差只用于在**已达
+硬限值**的映射之间裁决数值并列的最优结果, 绝不放宽硬限值。
 
 精确搜索(备品不重复使用的一对一完全枚举)
 ----------------------------------------
@@ -31,14 +35,18 @@ s 支**备品试管**(1 ≤ s ≤ 12, 编号互不相同, 质量为正, 且编�
 
 目标排序(字典序, 确定性)
 ------------------------
-1. **先选总质量差 D 最小的达标映射**(最终 |U₁| ≤ L);
+1. **先选总质量差 D 最小的达标映射**(最终 |U₁| 真正 ≤ L; 仅"容差内
+   超限"的映射不算达标);
 2. D 在数值容差(1e-9 相对容差, 与应急迁移/配重补偿等精确模块一致)内并列时,
    取最终残余 **|U₁| 最小**者;
 3. 仍并列时, 取**待换管号(升序)顺序对应的备品编号序列**字典序最小者,
    并统计达到该最优结果的映射条数。
 
-若没有任何达标映射, 返回**残余 |U₁| 最低**的映射(容差内并列时按上述备品编号
-序列裁决)、超限量与**不达标**结论, 不误报达标。
+若没有任何真正达标的映射, 返回**残余 |U₁| 最低**的映射(容差内并列时按
+上述备品编号序列裁决)、超限量与**不达标**结论, 不误报达标。最终 |U₁|
+与总质量均由裁决序列独立复算, 不依赖搜索时的浮点累加; 响应中的
+feasible / within_limit / 基线达标标记 / 超限量 / 余量 / 说明一律与该
+复算残余一致。
 
 拒绝条件(ValueError → HTTP 400)
 -------------------------------
@@ -59,12 +67,13 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from .plan_snapshot import parse_plan_snapshot
+from .plan_snapshot import hard_limit_slack, parse_plan_snapshot, within_hard_limit
 
 # 精确枚举规模上限: 待换管 4 支、备品 12 支(排列数 P(12,4)=11880)
 MAX_REPLACE = 4
 MAX_SPARES = 12
-# 与 app/evacuation.py / app/counterweight.py 一致的数值容差
+# 最优结果之间"数值并列"的相对容差: 仅用于在**已达硬限值**的候选中裁决
+# 并列最优(总质量差/残余 |U₁| 相同), 绝不用于放宽硬限值判定
 _NUM_TOL = 1e-9
 
 
@@ -265,9 +274,25 @@ def plan_spare_replacement(plan: dict[str, Any],
     rec(0, unc_x, unc_y, 0.0)
     evaluated = len(leaves)
 
-    limit_tol = _NUM_TOL * max(1.0, limit)
+    # 硬限值判定的绝对舍入余量(不随限值放大): 只吸收质径积向量求和的
+    # 双精度舍入误差; 物理上真正超限(即使仅超出极小量)的映射不会被计入
+    # 达标。求和项数为全部已放置试管数, 单项量级取原管/备品质径积最大者。
+    term_scale = max(
+        [abs(placed[tid]["vec"][0] + 1j * placed[tid]["vec"][1])
+         for tid in placed],
+        default=0.0,
+    )
+    for sp in spare_list:
+        for tid in replaced_ids:
+            term_scale = max(
+                term_scale,
+                abs(snap.mass_radius_vector(sp["mass_g"], placed[tid]["slot"])),
+            )
+    # 达标映射: 仅容绝对舍入余量, **不**使用随限值放大的相对容差——只有
+    # "容差内超限"的映射时不算达标, 直接走"无达标映射"分支(返回残余最低
+    # 映射与超限量), 不误报达标
     feasible_leaves = [(m, d, key) for m, d, key in leaves
-                       if m <= limit + limit_tol]
+                       if within_hard_limit(m, limit, term_scale, n)]
     if feasible_leaves:
         # ① 总质量差最小
         best_d = min(d for _, d, _ in feasible_leaves)
@@ -276,6 +301,8 @@ def plan_spare_replacement(plan: dict[str, Any],
                 if d <= best_d + d_tol]
         # ② 残余 |U₁| 最小
         best_mag = min(m for m, _, _ in band)
+        # 最优结果之间的数值并列容差(相对容差)只在此处裁决并列最优,
+        # 与硬限值判定无关
         mag_tol = _NUM_TOL * max(1.0, best_mag)
         optimal = [(m, d, key) for m, d, key in band
                    if m <= best_mag + mag_tol]
@@ -283,7 +310,7 @@ def plan_spare_replacement(plan: dict[str, Any],
         opt_key = min(key for _, _, key in optimal)
         opt_leaf = next(leaf for leaf in optimal if leaf[2] == opt_key)
         winner = True
-        chosen_mag, chosen_d, chosen_key = opt_leaf
+        chosen_key = opt_key
         optimal_count = len(optimal)
     else:
         # 无达标映射: 残余 |U₁| 最低; 容差内并列按备品编号序列裁决
@@ -294,7 +321,7 @@ def plan_spare_replacement(plan: dict[str, Any],
         best_key = min(key for _, _, key in tied)
         chosen_leaf = next(leaf for leaf in tied if leaf[2] == best_key)
         winner = False
-        chosen_mag, chosen_d, chosen_key = chosen_leaf
+        chosen_key = chosen_leaf[2]
         optimal_count = len(tied)
 
     # ---- 由裁决序列独立复算最终 U₁ 与逐管替换映射 ----
@@ -357,10 +384,15 @@ def plan_spare_replacement(plan: dict[str, Any],
         cell.setdefault("final_mass_g", cell["original_mass_g"])
     tube_rows = [final_slot_of[s] for s in sorted(final_slot_of)]
 
-    feasible = winner
-    within = final_mag <= limit + limit_tol
+    # 达标标记一律以裁决序列**独立复算**的残余 |U₁| 重新做硬限值判定
+    # (与搜索叶子的增量累加解耦): 搜索时判达标但复算残余真实超限的极端
+    # 情形按不达标处理
+    feasible = bool(winner) and within_hard_limit(
+        final_mag, limit, term_scale, n)
+    within = within_hard_limit(final_mag, limit, term_scale, n)
+    base_within = within_hard_limit(base_mag, limit, term_scale, n)
     excess = max(0.0, final_mag - limit)
-    margin = max(0.0, limit - final_mag)
+    margin = max(0.0, limit - final_mag) if within else 0.0
     map_txt = ", ".join(
         f"管 {r['replaced_tube_id']}({r['original_mass_g']:g} g, 槽 {r['slot']})"
         f"→备品 {r['spare_tube_id']}({r['spare_mass_g']:g} g)"
@@ -414,9 +446,9 @@ def plan_spare_replacement(plan: dict[str, Any],
             **baseline_block,
             "total_mass_g": base_total_mass,
             "centrifugal_force_n": omega ** 2 * base_mag * 1e-6,
-            "within_limit": base_mag <= limit + limit_tol,
+            "within_limit": base_within,
             "excess_g_mm": max(0.0, base_mag - limit),
-            "margin_g_mm": max(0.0, limit - base_mag),
+            "margin_g_mm": max(0.0, limit - base_mag) if base_within else 0.0,
         },
         "unchanged_tubes": unchanged_rows,
         "mappings": mapping_rows,

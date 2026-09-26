@@ -13,6 +13,7 @@ import random
 import unittest
 
 from app.counterweight import plan_counterweight_compensation
+from app.plan_snapshot import hard_limit_slack
 
 
 def _plan(pid, placements, radius=100.0, slots_n=12, enabled=None, name=None):
@@ -86,7 +87,18 @@ def _brute(plan, weights, limit, max_weights):
         ux += p["mass"] * radius * math.cos(a)
         uy += p["mass"] * radius * math.sin(a)
     base = complex(ux, uy)
-    lim_tol = 1e-9 * max(1.0, limit)
+    # 硬限值判定与被测模块一致: 只容绝对舍入余量, 不随限值放大
+    max_unit = max(
+        (abs(radius * complex(math.cos(math.radians(a)),
+                              math.sin(math.radians(a))))
+         for _, a in free),
+        default=0.0)
+    term_scale = max(abs(base), max_unit * (max(masses, default=0.0)))
+    n_tubes = len([p for p in res["placements"] if p["slot"] is not None])
+
+    def hard_ok(mag):
+        return mag <= limit + hard_limit_slack(
+            term_scale, n_tubes + max_weights)
 
     best_effort = None
     for k in range(0, max_weights + 1):
@@ -116,7 +128,7 @@ def _brute(plan, weights, limit, max_weights):
         bmag = next(m for m, key in btied if key == bkey)
         if best_effort is None or bmag < best_effort[0] - 1e-9:
             best_effort = (bmag, bkey, k, len(btied))
-        feas = [(m, key) for m, key in leaves if m <= limit + lim_tol]
+        feas = [(m, key) for m, key in leaves if hard_ok(m)]
         if feas:
             fm = min(m for m, _ in feas)
             ftol = 1e-9 * max(1.0, fm)
@@ -253,6 +265,42 @@ class TestCounterweightCompensation(unittest.TestCase):
         self.assertEqual(r["placements"], [])
         self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], 5000.0, places=6)
         self.assertAlmostEqual(r["excess_g_mm"], 4900.0, places=6)
+
+    def test_limit_tolerance_does_not_hide_real_exceedance(self):
+        # 边界回归: 补偿前/补偿后残余 |U₁|=5000、限值=4999.999999(真实超出
+        # 1e-6 g·mm)。旧实现用随限值放大的 1e-9 相对容差(约 5e-6)放宽硬
+        # 限值, 会把 k=0 的 5000 误判为达标。放置上限 0 时唯一组合残余
+        # 恰为 5000, 必须判不达标并给出 1e-6 的超限量。
+        p = _single_plan()
+        r = plan_counterweight_compensation(
+            p, [{"mass_g": 50.0, "stock": 3}],
+            u1_limit_g_mm=4999.999999, max_weights=0)
+        self.assertFalse(r["feasible"])
+        self.assertFalse(r["within_limit"])
+        self.assertFalse(r["baseline"]["within_limit"])
+        self.assertAlmostEqual(r["final"]["u1_mag_g_mm"], 5000.0, places=9)
+        self.assertAlmostEqual(r["excess_g_mm"], 1e-6, places=12)
+        self.assertEqual(r["margin_g_mm"], 0.0)
+        self.assertIn("不达标", r["reason"])
+
+    def test_layered_search_continues_past_tolerance_only_layer(self):
+        # 分层回归: k=0 残余恰为 5000(在限值 4999.999999 下仅落入旧相对
+        # 容差带, 物理上超限); 6e-9 g 的极轻配重放 1 枚(k=1)只能减少
+        # 6e-7 g·mm, 仍真实超限, 必须继续在 k=2 找真正达标的组合。
+        # 空槽 5/6/7(150°/180°/210°): k=2 取含 180° 空槽的组合(5,6 与
+        # 6,7 并列最优, 按槽号序列取 5,6), 沿 180° 方向合力
+        # = 100·6e-9·(1+cos30°) ≈ 1.12e-6 g·mm > 1e-6, 达标。
+        p = _single_plan(enabled={0, 5, 6, 7})
+        r = plan_counterweight_compensation(
+            p, [{"mass_g": 6e-9, "stock": 3}],
+            u1_limit_g_mm=4999.999999, max_weights=2)
+        self.assertTrue(r["feasible"])
+        self.assertTrue(r["within_limit"])
+        self.assertEqual(r["weights_used"], 2)
+        self.assertLessEqual(r["final"]["u1_mag_g_mm"], 4999.999999)
+        self.assertEqual(sorted(x["slot"] for x in r["placements"]), [5, 6])
+        self.assertGreater(r["margin_g_mm"], 0.0)
+        self.assertEqual(r["excess_g_mm"], 0.0)
 
     def test_no_free_slots(self):
         # 全部启用槽被占满: 配重无处可放, 只能评估 0 枚

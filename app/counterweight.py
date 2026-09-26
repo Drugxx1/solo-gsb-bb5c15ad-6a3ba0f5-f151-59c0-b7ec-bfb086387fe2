@@ -14,7 +14,11 @@
 
     U₁ = U₁(base) + R · Σ_{s∈S} m(s) · e^{iθ_s}      (g·mm)
 
-必须不超过给定的一阶不平衡量限值 L(必填, 非负)。
+必须不超过给定的一阶不平衡量限值 L(必填, 非负)。硬限值判定只允许一个
+**绝对**舍入余量(吸收双精度向量求和/三角函数的舍入误差, 1e-9 g·mm
+量级, 不随限值放大); 物理上真实超限(即使仅超出极小量, 如残余 5000、
+限值 4999.999999)一律判超限。1e-9 的相对容差只用于在**已达硬限值**的
+候选之间裁决数值并列的最优结果, 绝不放宽硬限值。
 
 精确搜索(按枚数分层的完全枚举)
 ------------------------------
@@ -30,16 +34,18 @@
 
 目标排序(字典序, 确定性)
 ------------------------
-1. 能达标(残余 |U₁| ≤ L)的**最少放置枚数** k* —— 从 k=0 起逐层枚举,
-   首个存在达标组合的 k 即 k*;
+1. 能达到硬限值(残余 |U₁| 真正 ≤ L)的**最少放置枚数** k* —— 从 k=0
+   起逐层枚举, 仅"容差内超限"的组合不算达标, 首个含真正达标组合的 k
+   即 k*;
 2. 在放置 k* 枚的达标组合中取残余 |U₁| **最低**者;
 3. 数值容差(1e-9 相对容差, 与应急迁移/复称规划等精确模块一致)内并列时,
    按**槽号及对应质量序列**裁决: 先比较槽号升序的槽位序列, 再比较这些槽位
    上对应的配重质量序列(字典序最小者胜出), 并统计达到该最优结果的组合数。
 
-若 0..M 枚内均无法达标, 给出限额内残余 |U₁| 最低的组合(并列时先取放置
-枚数少者, 再按槽号及质量序列升序)及超限量, 明确判定**不达标**, 不误报
-达标。
+若 0..M 枚内均无法达到硬限值, 给出限额内残余 |U₁| 最低的组合(并列时先取
+放置枚数少者, 再按槽号及质量序列升序)及超限量, 明确判定**不达标**,
+不误报达标。响应中的 feasible / within_limit / 基线达标标记 / 超限量 /
+余量 / 说明一律与对裁决序列**独立复算**的残余 |U₁| 一致。
 
 拒绝条件(ValueError → HTTP 400)
 -------------------------------
@@ -57,14 +63,15 @@ from __future__ import annotations
 import math
 from typing import Any, Optional
 
-from .plan_snapshot import parse_plan_snapshot
+from .plan_snapshot import hard_limit_slack, parse_plan_snapshot, within_hard_limit
 
 # 精确枚举规模上限: 空闲启用槽 16 个、配重 6 种、放置上限 3 枚
 # (叶子数 Σ_{k=0..3} C(16,k)·6^k ≈ 12.6 万)
 MAX_FREE_SLOTS = 16
 MAX_WEIGHT_TYPES = 6
 MAX_WEIGHTS = 3
-# 与 app/evacuation.py / app/reweigh.py 一致的数值容差
+# 最优结果之间"数值并列"的相对容差: 仅用于在**已达硬限值**的候选中裁决
+# 并列最优(残余 |U₁| 相同), 绝不用于放宽硬限值判定
 _NUM_TOL = 1e-9
 
 
@@ -230,7 +237,16 @@ def plan_counterweight_compensation(
         rec(0, 0, base_x, base_y)
         return leaves
 
-    limit_tol = _NUM_TOL * max(1.0, limit)
+    # 硬限值判定的绝对舍入余量(不随限值放大): 只吸收质径积向量求和的
+    # 双精度舍入误差; 物理上真正超限(即使仅超出极小量)的组合不会被计入
+    # 达标。求和项数为试管数 + 最多放置的配重枚数, 单项量级取试管质径积
+    # 与配重质径积中的最大者。
+    max_weight_term = (
+        max((abs(v) for v in unit_vecs), default=0.0)
+        * (max(usable_masses) if usable_masses else 0.0)
+    )
+    term_scale = max(abs(base_vec), max_weight_term)
+    term_count = tube_count + M
     evaluated = 0
     winner: Optional[dict[str, Any]] = None       # 首个达标 k 上的最优组合
     best_effort: Optional[dict[str, Any]] = None  # 0..M 内残余最低的组合
@@ -248,11 +264,16 @@ def plan_counterweight_compensation(
         if best_effort is None or k_best_mag < best_effort["mag"] - _NUM_TOL:
             best_effort = {"k": k, "mag": k_best_mag, "key": k_best_key,
                            "count": len(k_tied)}
-        # 达标组合(第一个存在达标组合的 k 即最少放置枚数)
+        # 达标组合(第一个存在达标组合的 k 即最少放置枚数): 仅容绝对舍入
+        # 余量, **不**使用随限值放大的相对容差——某层只有"容差内超限"的
+        # 组合时不算达标, 继续向更大枚数寻找真正达标的组合
         feasible_leaves = [(m, key) for m, key in leaves
-                           if m <= limit + limit_tol]
+                           if within_hard_limit(m, limit, term_scale,
+                                                term_count)]
         if feasible_leaves:
             best_mag = min(m for m, _ in feasible_leaves)
+            # 最优结果之间的数值并列容差(相对容差)只在此处裁决并列最优,
+            # 与硬限值判定无关
             mag_tol = _NUM_TOL * max(1.0, best_mag)
             optimal = [(m, key) for m, key in feasible_leaves
                        if m <= best_mag + mag_tol]
@@ -264,35 +285,49 @@ def plan_counterweight_compensation(
 
     # k=0 的空组合必然被评估, 故 best_effort 一定存在
     assert best_effort is not None
-    chosen = winner if winner is not None else best_effort
-    chosen_slots, chosen_masses = chosen["key"]
 
     # 由裁决序列独立复算残余 U₁(避免依赖搜索时的浮点累加), 并组装放置清单
     angle_of = {f["slot"]: f["angle_deg"] for f in free_slots}
-    placements_out: list[dict[str, Any]] = []
-    ux, uy = base_x, base_y
-    for slot, mass in zip(chosen_slots, chosen_masses):
-        # 与其他规划器共用快照的质径积向量计算(角度以槽位状态为准)
-        v = snap.mass_radius_vector(mass, slot)
-        vx, vy = v.real, v.imag
-        ux += vx
-        uy += vy
-        placements_out.append({
-            "slot": slot,
-            "angle_deg": angle_of[slot],
-            "mass_g": mass,
-            "u1_x_g_mm": vx,
-            "u1_y_g_mm": vy,
-            "u1_mag_g_mm": math.hypot(vx, vy),
-        })
-    final_block = _vec_block(ux, uy)
+
+    def _recompute(chosen_one: dict[str, Any]):
+        chosen_slots, chosen_masses = chosen_one["key"]
+        placements_built: list[dict[str, Any]] = []
+        ux, uy = base_x, base_y
+        for slot, mass in zip(chosen_slots, chosen_masses):
+            # 与其他规划器共用快照的质径积向量计算(角度以槽位状态为准)
+            v = snap.mass_radius_vector(mass, slot)
+            vx, vy = v.real, v.imag
+            ux += vx
+            uy += vy
+            placements_built.append({
+                "slot": slot,
+                "angle_deg": angle_of[slot],
+                "mass_g": mass,
+                "u1_x_g_mm": vx,
+                "u1_y_g_mm": vy,
+                "u1_mag_g_mm": math.hypot(vx, vy),
+            })
+        return placements_built, _vec_block(ux, uy)
+
+    # 获胜组合先以硬限值入围; 但其残余是否达标最终一律以裁决序列独立复算
+    # 的 |U₁| 重新判定(与搜索时的增量浮点累加解耦): 复算残余若真实超限,
+    # 退回限额内残余最低的对照组合 best_effort, 保证响应结论与复算残余一致
+    chosen = winner if winner is not None else best_effort
+    placements_out, final_block = _recompute(chosen)
     final_mag = final_block["u1_mag_g_mm"]
+    if winner is not None and not within_hard_limit(
+            final_mag, limit, term_scale, term_count):
+        winner = None
+        chosen = best_effort
+        placements_out, final_block = _recompute(chosen)
+        final_mag = final_block["u1_mag_g_mm"]
 
     feasible = winner is not None
-    within = final_mag <= limit + limit_tol
-    base_within = base_mag <= limit + limit_tol
+    # 硬限值判定(与最终复算残余一致): 仅容绝对舍入余量, 不随限值放大
+    within = within_hard_limit(final_mag, limit, term_scale, term_count)
+    base_within = within_hard_limit(base_mag, limit, term_scale, term_count)
     excess = max(0.0, final_mag - limit)
-    margin = max(0.0, limit - final_mag)
+    margin = max(0.0, limit - final_mag) if within else 0.0
     place_txt = ", ".join(
         f"槽 {p['slot']} 放 {p['mass_g']:g} g" for p in placements_out
     ) or "无"
@@ -350,7 +385,7 @@ def plan_counterweight_compensation(
             **baseline_block,
             "within_limit": base_within,
             "excess_g_mm": max(0.0, base_mag - limit),
-            "margin_g_mm": max(0.0, limit - base_mag),
+            "margin_g_mm": max(0.0, limit - base_mag) if base_within else 0.0,
         },
         "weights_used": chosen["k"],
         "placements": placements_out,

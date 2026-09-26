@@ -13,6 +13,7 @@ import random
 import unittest
 
 from app.evacuation import plan_slot_evacuation
+from app.plan_snapshot import hard_limit_slack
 
 
 def _plan(pid, placements, radius=100.0, slots_n=12, enabled=None, name=None):
@@ -119,10 +120,11 @@ def _brute(plan, failed, limit, max_moves):
         bmag = next(m for m, kk in btied if kk == bkey)
         if best_eff is None or bmag < best_eff[0] - 1e-9:
             best_eff = (bmag, bkey, k)
-        feas = [
-            (m, kk) for m, kk in leaves
-            if m <= limit + 1e-9 * max(1.0, limit)
-        ]
+        # 硬限值判定与被测模块一致: 只容绝对舍入余量, 不随限值放大
+        # (物理上真正超限的摆放即使在旧的相对容差内也不算达标)
+        max_term = max(abs(ovec[i]) for i in range(n))
+        slack = hard_limit_slack(max_term, n)
+        feas = [(m, kk) for m, kk in leaves if m <= limit + slack]
         if feas:
             fm = min(m for m, _ in feas)
             ftol = 1e-9 * max(1.0, fm)
@@ -209,6 +211,66 @@ class TestSlotEvacuation(unittest.TestCase):
                                2588.1904510252075 - 1300.0, places=6)
         # 顶层同样给出对照摆放
         self.assertEqual(r["moves"][0]["to_slot"], 1)
+
+    def test_limit_tolerance_does_not_hide_real_exceedance(self):
+        # 边界回归: 残余 |U₁|=5000、限值=4999.999999(真实超出 1e-6 g·mm)。
+        # 旧实现用 1e-9 相对容差(在 5000 量级约 5e-6)放宽硬限值, 会把这
+        # 1e-6 的真实超限误判为达标。单管 50 g@0° 占槽, 失效槽本就空闲、
+        # 移动上限 0: 唯一摆放的 |U₁| 恰为 5000, 必须判不达标。
+        p = _plan(1, {0: (1, 50.0, False)}, slots_n=4, enabled={0, 1, 2})
+        r = plan_slot_evacuation(p, failed_slots=[2],
+                                 u1_limit_g_mm=4999.999999, max_moves=0)
+        self.assertFalse(r["feasible"])
+        self.assertFalse(r["within_limit"])
+        self.assertAlmostEqual(r["final_u1"]["u1_mag_g_mm"], 5000.0, places=9)
+        self.assertAlmostEqual(r["excess_g_mm"], 1e-6, places=12)
+        self.assertEqual(r["margin_g_mm"], 0.0)
+        self.assertIn("没有", r["reason"])
+
+    def test_layered_search_continues_past_tolerance_only_layer(self):
+        # 分层回归: k=0 的原摆放残余恰为 5000(在限值 4999.999999 下仅落入
+        # 旧的相对容差带, 物理上超限), 必须**继续**在 k=1 找真正达标的
+        # 摆放, 而不是把 k=0 标为达标后提前结束。
+        # 管 1=50 g@0°、管 2=50 g@120° => 原 |U₁|=5000; 槽 2@180° 空、
+        # 槽 3@240° 为(空闲的)新失效槽。管 2 由 120° 迁至 180° 后与管 1
+        # 对径, 残余恰为 0, 且只移动 1 支。
+        slot_state = [
+            {"slot": 0, "angle": 0.0, "enabled": True, "tube_id": 1,
+             "locked": False},
+            {"slot": 1, "angle": 120.0, "enabled": True, "tube_id": 2,
+             "locked": False},
+            {"slot": 2, "angle": 180.0, "enabled": True, "tube_id": None,
+             "locked": False},
+            {"slot": 3, "angle": 240.0, "enabled": True, "tube_id": None,
+             "locked": False},
+        ]
+        pls = [
+            {"tube_id": 1, "mass": 50.0, "slot": 0, "angle": 0.0,
+             "locked": False},
+            {"tube_id": 2, "mass": 50.0, "slot": 1, "angle": 120.0,
+             "locked": False},
+        ]
+        p = {
+            "id": 1, "name": "分层继续", "created_at": "2026-09-26T00:00:00",
+            "request": {"radius_mm": 100.0},
+            "result": {
+                "config": {"radius_mm": 100.0},
+                "slot_state": slot_state, "placements": pls,
+                "metrics": {"u1_mag_g_mm": 5000.0},
+            },
+        }
+        self.assertAlmostEqual(
+            abs(5000.0 + 5000.0 * complex(-0.5, math.sqrt(3) / 2)),
+            5000.0, places=9)
+        r = plan_slot_evacuation(p, failed_slots=[3],
+                                 u1_limit_g_mm=4999.999999, max_moves=1)
+        self.assertTrue(r["feasible"])
+        self.assertTrue(r["within_limit"])
+        self.assertEqual(r["moves_required"], 1)
+        self.assertAlmostEqual(r["final_u1"]["u1_mag_g_mm"], 0.0, places=9)
+        moved = {(m["tube_id"], m["from_slot"], m["to_slot"])
+                 for m in r["moves"]}
+        self.assertEqual(moved, {(2, 1, 2)})
 
     def test_locked_on_failed_slot_infeasible(self):
         p = _plan(1, {0: (1, 50.0, True), 6: (2, 50.0, False)})

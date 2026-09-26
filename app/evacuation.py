@@ -15,7 +15,11 @@
 
       U₁ = R · Σ_k m_k · e^{iθ_k(final)}             (g·mm)
 
-  必须不超过给定限值 L(必填, 非负)。
+  必须不超过给定限值 L(必填, 非负)。硬限值判定只允许一个**绝对**舍入
+  余量(吸收双精度向量求和/三角函数的舍入误差, 1e-9 g·mm 量级, 不随
+  限值放大); 物理上真实超限(即使仅超出极小量, 如残余 5000、限值
+  4999.999999)一律判超限。1e-9 的相对容差只用于在**已达硬限值**的候选
+  之间裁决数值并列的最优结果, 绝不放宽硬限值。
 
 精确搜索(按移动数分层的完全枚举)
 --------------------------------
@@ -29,8 +33,9 @@
   叶子总数  ≤ ~4.4 万(k=0..3 合计), 瞬时完成。
 
 服务端对每个 k(从 f 起, 到 M 止)枚举全部子集 × 全部合法目标槽注入
-(回溯剪枝: 目标槽唯一、不得等于该管原槽), **精确**寻找使 |U₁| ≤ L 的
-摆放, 找到的第一个可行 k 即最少移动管数。
+(回溯剪枝: 目标槽唯一、不得等于该管原槽), **精确**寻找真正满足硬限值
+|U₁| ≤ L 的摆放。仅"容差内超限"的摆放不算达标: 该层没有真正达标的摆放
+时继续向更大移动数搜索, 找到的第一个含达标摆放的 k 即最少移动管数。
 
 目标排序(字典序, 确定性)
 ------------------------
@@ -41,9 +46,10 @@
    (final_slot(tube_id 最小), final_slot(tube_id 次小), …)字典序最小者;
    未移动试管的目标槽即原槽, 一并参与该序列比较。
 
-同时统计达到该最优结果的摆放条数。任何 k 都找不到满足限值的摆放时
+同时统计达到该最优结果的摆放条数。任何 k 都找不到真正满足硬限值的摆放时
 明确说明无可行摆放, 并给出移动数不超过 M 的范围内 |U₁| 最小的对照摆放
-(仅供参考, 不落库、不覆盖原方案)。
+(仅供参考, 不落库、不覆盖原方案)。响应中的 feasible / within_limit /
+超限量 / 余量 / 说明一律与对裁决序列**独立复算**的最终 |U₁| 一致。
 
 拒绝条件(ValueError → HTTP 400)
 -------------------------------
@@ -62,13 +68,14 @@ import math
 from itertools import combinations
 from typing import Any, Optional
 
-from .plan_snapshot import parse_plan_snapshot
+from .plan_snapshot import hard_limit_slack, parse_plan_snapshot, within_hard_limit
 
 # 搜索规模上限: 试管 10 支、启用槽 16 个、移动上限 3
 MAX_TUBES = 10
 MAX_ENABLED_SLOTS = 16
 MAX_MOVES = 3
-# 与 app/compare.py / app/loading.py 一致的数值容差
+# 最优结果之间"数值并列"的相对容差: 仅用于在**已达硬限值**的候选中裁决
+# 并列最优(最终 |U₁| 相同), 绝不用于放宽硬限值判定
 _NUM_TOL = 1e-9
 
 
@@ -351,7 +358,13 @@ def plan_slot_evacuation(plan: dict[str, Any],
         mag = next(m for m, k in tied if k == key)
         return mag, key
 
-    limit_tol = _NUM_TOL * max(1.0, limit)
+    # 硬限值判定的绝对舍入余量(不随限值放大): 只吸收质径积向量求和的
+    # 双精度舍入误差; 物理上真正超限(即使仅超出极小量)的摆放不会被计入
+    # 达标。单项量级取最大试管质径积, 求和项数为全部已放置试管数。
+    max_term_scale = max(
+        (abs(origin_vec[j]) for j in range(n)), default=0.0
+    )
+
     winner: Optional[dict[str, Any]] = None       # 首个可行 k 上的最优摆放
     best_effort: Optional[dict[str, Any]] = None  # 0..M 内 |U₁| 最小的摆放
     evaluated = 0
@@ -365,10 +378,15 @@ def plan_slot_evacuation(plan: dict[str, Any],
         k_best_mag, k_best_key = _best_of(mags)
         if best_effort is None or k_best_mag < best_effort["mag"] - _NUM_TOL:
             best_effort = {"k": k, "mag": k_best_mag, "key": k_best_key}
-        # 满足限值的摆放(第一个可行 k 即最少移动数)
-        feasible_leaves = [(m, key) for m, key in mags if m <= limit + limit_tol]
+        # 满足硬限值的摆放(第一个可行 k 即最少移动数): 仅容绝对舍入余量,
+        # **不**使用随限值放大的相对容差——某层只有"容差内超限"的摆放时
+        # 不算达标, 继续向更大移动数寻找真正达标的方案
+        feasible_leaves = [(m, key) for m, key in mags
+                           if within_hard_limit(m, limit, max_term_scale, n)]
         if feasible_leaves:
             best_mag = min(m for m, _ in feasible_leaves)
+            # 最优结果之间的数值并列容差(相对容差)只在此处裁决并列最优,
+            # 与硬限值判定无关
             mag_tol = _NUM_TOL * max(1.0, best_mag)
             optimal = [
                 (m, key) for m, key in feasible_leaves
@@ -420,18 +438,25 @@ def plan_slot_evacuation(plan: dict[str, Any],
 
     if winner is not None:
         payload = _arrangement_payload(winner["k"], winner["key"], winner["count"])
-        out.update(payload)
-        out["feasible"] = True
-        out["within_limit"] = True
+        # 达标标记一律以裁决序列**独立复算**的残余 |U₁| 重新做硬限值判定:
+        # 搜索叶子的增量累加与最终复算的求和次序不同, 极端舍入下可能差
+        # ~1e-12 g·mm; 若复算残余真实超限, 该获胜者不成立, 退回输出限额内
+        # 残余最低的对照摆放(best_effort)
         final_mag = payload["final_u1"]["u1_mag_g_mm"]
-        out["excess_g_mm"] = 0.0
-        out["margin_g_mm"] = max(0.0, limit - final_mag)
-        out["reason"] = (
-            f"移动 {winner['k']} 支试管(已达最少移动数)即可满足限值: "
-            f"最终 |U₁|={final_mag:.6g} g·mm ≤ {limit:g} g·mm; "
-            f"迁移前 |U₁|={original_block['u1_mag_g_mm']:.6g} g·mm。"
-        )
-        return out
+        if within_hard_limit(final_mag, limit, max_term_scale, n):
+            out.update(payload)
+            out["feasible"] = True
+            out["within_limit"] = True
+            out["excess_g_mm"] = 0.0
+            out["margin_g_mm"] = max(0.0, limit - final_mag)
+            out["reason"] = (
+                f"移动 {winner['k']} 支试管(已达最少移动数)即可满足限值: "
+                f"最终 |U₁|={final_mag:.6g} g·mm ≤ {limit:g} g·mm; "
+                f"迁移前 |U₁|={original_block['u1_mag_g_mm']:.6g} g·mm。"
+            )
+            return out
+        # 防御性兜底: 搜索时判达标但独立复算超限(理论上不发生), 不作为获胜方案
+        winner = None
 
     # ---- 无可行摆放 ----
     if best_effort is None:
@@ -447,6 +472,8 @@ def plan_slot_evacuation(plan: dict[str, Any],
 
     payload = _arrangement_payload(best_effort["k"], best_effort["key"], None)
     be_mag = payload["final_u1"]["u1_mag_g_mm"]
+    # 对照摆放的达标标记同样以最终复算残余做硬限值判定(物理上超限即不达标)
+    be_within = within_hard_limit(be_mag, limit, max_term_scale, n)
     out["best_effort"] = {
         "description": (
             f"在最多移动 {M} 支试管的范围内使最终 |U₁| 最小的摆放"
@@ -461,9 +488,9 @@ def plan_slot_evacuation(plan: dict[str, Any],
     out["final_u1"] = payload["final_u1"]
     out["tubes"] = payload["tubes"]
     out["moves"] = payload["moves"]
-    out["within_limit"] = False
+    out["within_limit"] = bool(be_within)
     out["excess_g_mm"] = max(0.0, be_mag - limit)
-    out["margin_g_mm"] = 0.0
+    out["margin_g_mm"] = max(0.0, limit - be_mag)
     out["reason"] = (
         f"在移动上限 {M} 支以内, 共精确评估 {evaluated} 种合法摆放, "
         f"没有使最终 |U₁| ≤ 限值 {limit:g} g·mm 的摆放; "
